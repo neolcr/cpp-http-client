@@ -1,0 +1,11 @@
+/build/
+/.zig-cache/
+/zig-out/
+/.vs/
+/.vscode/
+*.pfx
+*.p12
+*.key
+*.cer
+*.crt
+
