@@ -57,6 +57,11 @@ cl /nologo /std:c++20 /EHsc /W4 /utf-8 standalone\mtls_client.cpp /Fo:build\mtls
 
 ## Usage
 
+To extract a field such as `productType` from the JSON inside a response's
+`body`, use the separate [standalone response reader](response_reader/README.md).
+It accepts the client's stdout through a pipe and takes the field name as a
+command-line argument.
+
 ```bat
 set MTLS_PFX_PASSWORD=change-me
 zig-out\bin\mtls_client.exe ^
