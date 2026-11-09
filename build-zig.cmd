@@ -35,5 +35,19 @@ if errorlevel 1 exit /b 1
 zig-out\bin\core_tests.exe
 if errorlevel 1 exit /b 1
 
+echo Building and running Windows options tests...
+zig c++ ^
+    -target %ZIG_TARGET% ^
+    -std=c++20 -O2 -Wall -Wextra -Wpedantic ^
+    -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX ^
+    -Iinclude ^
+    src\core.cpp tests\options_test.cpp ^
+    -lwinhttp -lcrypt32 -lncrypt -ladvapi32 ^
+    -o zig-out\bin\options_test.exe
+if errorlevel 1 exit /b 1
+
+zig-out\bin\options_test.exe
+if errorlevel 1 exit /b 1
+
 echo Built zig-out\bin\mtls_client.exe successfully.
 endlocal

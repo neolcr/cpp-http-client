@@ -32,6 +32,29 @@ ctest --test-dir build -C Release --output-on-failure
 
 The executable is normally written to `build\Release\mtls_client.exe`. Both build paths link only Windows system libraries: `winhttp`, `crypt32`, `ncrypt`, and `advapi32`.
 
+## Single-file version
+
+`standalone/mtls_client.cpp` contains the complete application in one C++ file,
+including HTTP/HTTPS support and optional PFX authentication. You can copy it
+to another directory without any project headers or sources. It requires Windows
+and a C++20 compiler. This is a snapshot; future changes to `src/` or `include/`
+must also be applied to the single-file version.
+
+From the project root, build it with Zig:
+
+```powershell
+New-Item -ItemType Directory -Force build | Out-Null
+zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Wpedantic -municode standalone/mtls_client.cpp -lwinhttp -lcrypt32 -lncrypt -ladvapi32 -o build/mtls_client_standalone.exe
+.\build\mtls_client_standalone.exe --method GET --url "http://localhost:8080/api/hello"
+```
+
+Or, from an MSVC developer prompt:
+
+```bat
+if not exist build mkdir build
+cl /nologo /std:c++20 /EHsc /W4 /utf-8 standalone\mtls_client.cpp /Fo:build\mtls_client_standalone.obj /Fe:build\mtls_client_standalone.exe /link winhttp.lib crypt32.lib ncrypt.lib advapi32.lib
+```
+
 ## Usage
 
 ```bat
@@ -48,15 +71,37 @@ zig-out\bin\mtls_client.exe ^
 
 Arguments:
 
-- `--method <verb>` and `--url <https-url>` are required.
+- `--method <verb>` and `--url <http-or-https-url>` are required. Include the `http://` or `https://` scheme.
 - `--header "Name: value"` may be repeated.
 - `--body <UTF-8 text>` and `--body-file <path>` are mutually exclusive.
-- `--pfx <path>` is required. The PFX must contain exactly one currently valid client-auth certificate with an accessible private key.
-- Supply the password with `--pfx-password-env <name>` (recommended), `--pfx-password <value>`, or a hidden interactive prompt.
+- `--pfx <path>` is optional. If omitted or the file does not exist, the request proceeds without a client certificate. Existing PFX files must contain exactly one certificate with an accessible private key. The client does not filter certificates by validity dates or client-auth usage; invalid files, incorrect passwords, and file access errors still fail.
+- When a PFX file exists, supply the password with `--pfx-password-env <name>` (recommended), `--pfx-password <value>`, or a hidden interactive prompt. Password options are ignored when no PFX is used.
 - `--max-response-bytes <count>` changes the default 16 MiB response limit.
 
 Stdout contains exactly one JSON object. Text responses use `body`; non-UTF-8 responses use `bodyBase64` and `bodyEncoding`. HTTP error statuses are valid responses with `ok: true`; transport, certificate, argument, and size failures return `ok: false` and process exit code 1.
 
+For HTTPS without a client certificate:
+
+```bat
+zig-out\bin\mtls_client.exe --method GET --url "https://api.example.com/"
+```
+
+Servers that require mutual TLS still require a valid client certificate.
+
+For a local HTTP server:
+
+```powershell
+.\zig-out\bin\mtls_client.exe --method GET --url "http://localhost:8080/api/hello"
+```
+
+HTTP does not use TLS. An existing PFX may only be used with an HTTPS URL.
+
 ## Security behavior
 
-Windows performs normal server-chain and hostname validation. The client does not install trust anchors, ignore certificate errors, or follow redirects. Import uses a temporary PFX store and does not persist the private key. Password command-line arguments are supported for compatibility but may be visible to other local processes; prefer an environment variable or the prompt. Do not commit certificates or passwords.
+Both versions ignore HTTPS server certificate hostname, unknown-authority, date, and usage errors on every HTTPS request, with or without a PFX. This relaxes server authentication; other TLS failures can still prevent a connection. Redirects remain disabled.
+
+PFX import uses `CRYPT_USER_KEYSET` without `PKCS12_NO_PERSIST_KEY`, allowing imported private keys to persist under the current Windows user. Closing the imported certificate store does not explicitly delete these keys.
+
+TLS failure diagnostics are written to stderr: `CERT_CN_INVALID`, `CERT_DATE_INVALID`, `INVALID_CA`, `CERT_REV_FAILED`, and `CERT_WRONG_USAGE`, when reported by WinHTTP. Security flags are also printed if reading the HTTP status code fails. Stdout remains the JSON response or error.
+
+Password command-line arguments are supported for compatibility but may be visible to other local processes; prefer an environment variable or the prompt. Do not commit certificates or passwords.

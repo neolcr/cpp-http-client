@@ -156,6 +156,8 @@ Options parse_options(int argc, wchar_t** argv) {
     std::filesystem::path body_file;
     bool has_body = false;
     bool has_password = false;
+    std::wstring password_env;
+    bool password_from_env = false;
     for (int index = 1; index < argc; ++index) {
         const std::wstring_view argument(argv[index]);
         if (argument == L"--method") {
@@ -188,9 +190,8 @@ Options parse_options(int argc, wchar_t** argv) {
         } else if (argument == L"--pfx-password-env") {
             if (has_password) throw AppError("arguments", 2, "Use only one password option");
             const auto name = required_value(index, argc, argv, argument);
-            const wchar_t* value = _wgetenv(name.c_str());
-            if (value == nullptr) throw AppError("arguments", 2, "Password environment variable is not set");
-            options.password = value;
+            password_env = name;
+            password_from_env = true;
             has_password = true;
         } else if (argument == L"--max-response-bytes") {
             const auto text = required_value(index, argc, argv, argument);
@@ -209,9 +210,23 @@ Options parse_options(int argc, wchar_t** argv) {
     }
     if (!valid_method(options.method)) throw AppError("arguments", 2, "A valid --method is required");
     if (options.url.empty()) throw AppError("arguments", 2, "--url is required");
-    if (options.pfx.empty()) throw AppError("arguments", 2, "--pfx is required");
     if (!body_file.empty()) options.body = read_file(body_file, "body");
-    if (!has_password) options.password = prompt_password();
+    if (!options.pfx.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(options.pfx, error);
+        if (error) throw AppError("pfx", static_cast<unsigned long>(error.value()),
+                                  "Cannot inspect PFX file: " + error.message());
+        if (!exists) options.pfx.clear();
+    }
+    if (!options.pfx.empty()) {
+        if (password_from_env) {
+            const wchar_t* value = _wgetenv(password_env.c_str());
+            if (value == nullptr) throw AppError("arguments", 2, "Password environment variable is not set");
+            options.password = value;
+        } else if (!has_password) {
+            options.password = prompt_password();
+        }
+    }
     return options;
 }
 
@@ -219,6 +234,7 @@ struct ParsedUrl {
     std::wstring host;
     std::wstring target;
     INTERNET_PORT port = 0;
+    bool secure = false;
 };
 
 ParsedUrl parse_url(const std::wstring& url) {
@@ -234,9 +250,10 @@ ParsedUrl parse_url(const std::wstring& url) {
     if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &components)) {
         fail_windows("url", "Parse URL");
     }
-    if (components.nScheme != INTERNET_SCHEME_HTTPS || components.lpszHostName == nullptr ||
+    if ((components.nScheme != INTERNET_SCHEME_HTTPS && components.nScheme != INTERNET_SCHEME_HTTP) ||
+        components.lpszHostName == nullptr ||
         components.dwHostNameLength == 0) {
-        throw AppError("url", 2, "URL must be an absolute https:// URL with a host");
+        throw AppError("url", 2, "URL must be an absolute http:// or https:// URL with a host");
     }
     if (url.find(L'#') != std::wstring::npos) {
         throw AppError("url", 2, "URL fragments are not sent in HTTP requests and are not accepted");
@@ -244,6 +261,7 @@ ParsedUrl parse_url(const std::wstring& url) {
     ParsedUrl parsed;
     parsed.host.assign(components.lpszHostName, components.dwHostNameLength);
     parsed.port = components.nPort;
+    parsed.secure = components.nScheme == INTERNET_SCHEME_HTTPS;
     if (components.lpszUrlPath != nullptr && components.dwUrlPathLength != 0) {
         parsed.target.assign(components.lpszUrlPath, components.dwUrlPathLength);
     } else {
@@ -253,21 +271,6 @@ ParsedUrl parse_url(const std::wstring& url) {
         parsed.target.append(components.lpszExtraInfo, components.dwExtraInfoLength);
     }
     return parsed;
-}
-
-bool supports_client_auth(PCCERT_CONTEXT certificate) {
-    DWORD size = 0;
-    if (!CertGetEnhancedKeyUsage(certificate, 0, nullptr, &size)) {
-        return GetLastError() == CRYPT_E_NOT_FOUND;
-    }
-    std::vector<std::uint8_t> buffer(size);
-    auto* usage = reinterpret_cast<PCERT_ENHKEY_USAGE>(buffer.data());
-    if (!CertGetEnhancedKeyUsage(certificate, 0, usage, &size)) return false;
-    if (usage->cUsageIdentifier == 0) return true;
-    for (DWORD index = 0; index < usage->cUsageIdentifier; ++index) {
-        if (std::string_view(usage->rgpszUsageIdentifier[index]) == szOID_PKIX_KP_CLIENT_AUTH) return true;
-    }
-    return false;
 }
 
 bool has_private_key(PCCERT_CONTEXT certificate) {
@@ -313,19 +316,18 @@ Identity load_identity(const std::filesystem::path& path, std::wstring& password
     CRYPT_DATA_BLOB blob{static_cast<DWORD>(bytes.size()), bytes.data()};
     if (!PFXIsPFXBlob(&blob)) throw AppError("pfx", 4, "File is not a valid PFX/PKCS#12 blob");
     CertStore store(PFXImportCertStore(&blob, password.c_str(),
-                                       CRYPT_USER_KEYSET | PKCS12_NO_PERSIST_KEY));
+                                       CRYPT_USER_KEYSET));
     if (!store) fail_windows("pfx", "Import PFX");
 
     std::vector<Certificate> matches;
     PCCERT_CONTEXT current = nullptr;
     while ((current = CertEnumCertificatesInStore(store.get(), current)) != nullptr) {
-        if (CertVerifyTimeValidity(nullptr, current->pCertInfo) == 0 &&
-            supports_client_auth(current) && has_private_key(current)) {
+        if (has_private_key(current)) {
             matches.emplace_back(CertDuplicateCertificateContext(current));
         }
     }
-    if (matches.empty()) throw AppError("certificate", 4, "PFX has no valid client-auth certificate with a private key");
-    if (matches.size() != 1) throw AppError("certificate", 4, "PFX has multiple suitable client certificates; selection is ambiguous");
+    if (matches.empty()) throw AppError("certificate", 4, "PFX has no certificate with an accessible private key");
+    if (matches.size() != 1) throw AppError("certificate", 4, "PFX has multiple certificates with accessible private keys; selection is ambiguous");
     auto selected = std::move(matches.front());
     return {std::move(store), std::move(selected)};
 }
@@ -344,9 +346,51 @@ std::wstring query_header_text(HINTERNET request, DWORD query) {
     return std::wstring(buffer.data(), length != 0 && buffer[length - 1] == L'\0' ? length - 1 : length);
 }
 
+void configure_request_security(HINTERNET request, bool secure) {
+    auto callback = [](HINTERNET, DWORD_PTR, DWORD status, LPVOID info, DWORD) {
+        if (status == WINHTTP_CALLBACK_STATUS_SECURE_FAILURE) {
+            const DWORD failures = *static_cast<DWORD*>(info);
+
+            if (failures & WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID)
+                std::cerr << "CERT_CN_INVALID\n";
+
+            if (failures & WINHTTP_CALLBACK_STATUS_FLAG_CERT_DATE_INVALID)
+                std::cerr << "CERT_DATE_INVALID\n";
+
+            if (failures & WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CA)
+                std::cerr << "INVALID_CA\n";
+
+            if (failures & WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED)
+                std::cerr << "CERT_REV_FAILED\n";
+
+            if (failures & WINHTTP_CALLBACK_STATUS_FLAG_CERT_WRONG_USAGE)
+                std::cerr << "CERT_WRONG_USAGE\n";
+        }
+    };
+    WinHttpSetStatusCallback(request, callback, WINHTTP_CALLBACK_FLAG_SECURE_FAILURE, 0);
+
+    if (secure) {
+        DWORD security_flags =
+            SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+            SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS,
+                              &security_flags, sizeof(security_flags))) {
+            fail_windows("request", "Set security flags");
+        }
+    }
+}
+
 std::string execute(Options& options) {
     const auto parsed = parse_url(options.url);
-    auto identity = load_identity(options.pfx, options.password);
+    if (!parsed.secure && !options.pfx.empty()) {
+        throw AppError("certificate", 2, "A client certificate requires an https:// URL");
+    }
+    PasswordWiper wipe(options.password);
+    Identity identity;
+    if (!options.pfx.empty()) identity = load_identity(options.pfx, options.password);
 
     InternetHandle session(WinHttpOpen(L"windows-mtls-client/1.0",
                                         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -358,16 +402,19 @@ std::string execute(Options& options) {
                                                parsed.target.c_str(), nullptr,
                                                WINHTTP_NO_REFERER,
                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                               WINHTTP_FLAG_SECURE));
+                                               parsed.secure ? WINHTTP_FLAG_SECURE : 0));
     if (!request) fail_windows("request", "Create request");
+    configure_request_security(request.get(), parsed.secure);
 
     DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY,
                           &redirect_policy, sizeof(redirect_policy))) {
         fail_windows("request", "Disable redirects");
     }
-    if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_CLIENT_CERT_CONTEXT,
-                          const_cast<CERT_CONTEXT*>(identity.certificate.get()), sizeof(CERT_CONTEXT))) {
+    if (parsed.secure && !WinHttpSetOption(request.get(), WINHTTP_OPTION_CLIENT_CERT_CONTEXT,
+                          identity.certificate ? const_cast<CERT_CONTEXT*>(identity.certificate.get())
+                                               : WINHTTP_NO_CLIENT_CERT_CONTEXT,
+                          identity.certificate ? sizeof(CERT_CONTEXT) : 0)) {
         fail_windows("certificate", "Attach client certificate");
     }
     for (const auto& header : options.headers) {
@@ -396,7 +443,16 @@ std::string execute(Options& options) {
     if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
                              WINHTTP_NO_HEADER_INDEX)) {
-        fail_windows("response_headers", "Read status code");
+        const auto status_error = GetLastError();
+
+        DWORD flags = 0;
+        DWORD len = sizeof(flags);
+
+        if (WinHttpQueryOption(request.get(), WINHTTP_OPTION_SECURITY_FLAGS, &flags, &len)) {
+            std::cerr << "SECURITY FLAGS = 0x" << std::hex << flags << std::dec << '\n';
+        }
+        throw AppError("response_headers", status_error,
+                       "Read status code: " + windows_message(status_error));
     }
     const auto reason = utf8(query_header_text(request.get(), WINHTTP_QUERY_STATUS_TEXT));
     const auto raw_headers = utf8(query_header_text(request.get(), WINHTTP_QUERY_RAW_HEADERS_CRLF));
